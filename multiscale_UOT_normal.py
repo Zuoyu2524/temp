@@ -42,7 +42,7 @@ class CandidateState:
     @property
     def lower_bound(self) -> float:
         return max(self.lower_bound_dual, self.exact_dual)
-    
+
     @property
     def upper_bound(self) -> float:
         return min(self.upper_bound_primal, self.exact_primal)
@@ -65,6 +65,16 @@ class QuantizedDataset:
     measure: np.ndarray
     num_clusters_list: List[int]
     cluster_results: Dict[int, Dict[str, np.ndarray]]
+    mappings: Dict[int, np.ndarray]
+
+
+@dataclass
+class LevelWarmState:
+    block_number: int
+    lower_plans: np.ndarray
+    upper_plans: np.ndarray
+    fs: np.ndarray
+    gs: np.ndarray
 
 
 def get_torch_dtype(dtype_name: str) -> torch.dtype:
@@ -138,10 +148,14 @@ def read_quantized_point_cloud_batch(input_path: str) -> QuantizedDataset:
         sample_ids = h5f["sample_ids"][:].astype(np.int64)
         data_coords = h5f["data_coords"][:].astype(np.float32)
         measure = h5f["measure"][:].astype(np.float32)
+
         num_clusters_list = sorted(
             int(v) for v in np.asarray(h5f.attrs["num_clusters_list"], dtype=np.int32)
         )
+
         cluster_results: Dict[int, Dict[str, np.ndarray]] = {}
+        mappings: Dict[int, np.ndarray] = {}
+
         for block_number in num_clusters_list:
             cluster_results[block_number] = {
                 "clusters": h5f[f"clusters_{block_number}"][:].astype(np.int32),
@@ -152,12 +166,18 @@ def read_quantized_point_cloud_batch(input_path: str) -> QuantizedDataset:
                 "cluster_variances": h5f[f"cluster_variances_{block_number}"][:].astype(np.float32),
             }
 
+        for block_number in num_clusters_list[1:]:
+            mapping_name = f"mapping_{block_number}"
+            if mapping_name in h5f:
+                mappings[block_number] = h5f[mapping_name][:].astype(np.int64)
+
     return QuantizedDataset(
         sample_ids=sample_ids,
         data_coords=data_coords,
         measure=measure,
         num_clusters_list=num_clusters_list,
         cluster_results=cluster_results,
+        mappings=mappings,
     )
 
 
@@ -180,6 +200,10 @@ def build_candidate_states(
 
 def get_level(dataset: QuantizedDataset, block_number: int) -> Dict[str, np.ndarray]:
     return dataset.cluster_results[int(block_number)]
+
+
+def get_mapping(dataset: QuantizedDataset, block_number: int) -> np.ndarray:
+    return dataset.mappings[int(block_number)]
 
 
 def reset_coarse_level_state(candidates: Sequence[CandidateState]) -> None:
@@ -286,9 +310,9 @@ def dual_repair_batched(
     cost: torch.Tensor,
     lambda_a: float,
     lambda_b: float,
-    feasibility_tol: float = 1e-3,
+    feasibility_tol: float = 1e-2,
     eps: float = EPS,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     row_marginal = plan.sum(dim=2)
     col_marginal = plan.sum(dim=1)
 
@@ -312,7 +336,7 @@ def dual_repair_batched(
     Y = torch.sum(b * torch.exp(-g_new / lambda_b), dim=1)
     geometric_mean = (X**psi) * (Y**phi)
     dual_value = lambda_a * (torch.sum(a, dim=1) - geometric_mean) + lambda_b * (torch.sum(b, dim=1) - geometric_mean)
-    return dual_value, valid_mask
+    return dual_value, valid_mask, f_new, g_new
 
 
 def compute_mm_dual_bounds_batched(
@@ -333,8 +357,8 @@ def compute_mm_dual_bounds_batched(
         iters,
         init_plan=init_plan,
     )
-    dual_lb, valid_mask = dual_repair_batched(a, b, plan, cost, lambda_a, lambda_b)
-    return dual_lb, primal_ub, plan, valid_mask
+    dual_lb, valid_mask, f, g = dual_repair_batched(a, b, plan, cost, lambda_a, lambda_b)
+    return dual_lb, primal_ub, plan, valid_mask, f, g
 
 
 def batched_bounding_ball_cost(
@@ -359,8 +383,72 @@ def batched_product_lift_cost(
 
 def batched_exact_cost(coords_a: torch.Tensor, coords_b: torch.Tensor) -> torch.Tensor:
     return batched_pairwise_sq_dists(coords_a, coords_b)
-    
 
+
+def prolong_plan_to_children_batch(
+    parent_plan: torch.Tensor,
+    map_a: torch.Tensor,
+    map_b: torch.Tensor,
+    a_pi: torch.Tensor,
+    a_pi_prime: torch.Tensor,
+    b_pi: torch.Tensor,
+    b_pi_prime: torch.Tensor,
+    eps: float = EPS,
+) -> torch.Tensor:
+    row_ratio = a_pi_prime / torch.gather(a_pi, 1, map_a)
+    col_ratio = b_pi_prime / torch.gather(b_pi, 1, map_b)
+
+    batch = torch.arange(parent_plan.shape[0], device=parent_plan.device)[:, None, None]
+
+    child_plan = parent_plan[batch, map_a[:, :, None], map_b[:, None, :]]
+
+    child_plan.mul_(row_ratio[:, :, None])
+    child_plan.mul_(col_ratio[:, None, :])
+
+    return child_plan.clamp_min_(0.0)
+
+
+def prolong_potentials_to_children_batch(
+    f: Optional[torch.Tensor],
+    g: Optional[torch.Tensor],
+    map_a: torch.Tensor,
+    map_b: torch.Tensor,
+):
+    if f is None or g is None:
+        return None, None
+
+    f_child = torch.gather(f, 1, map_a)
+    g_child = torch.gather(g, 1, map_b)
+
+    return f_child, g_child
+
+
+def project_plan_to_marginals_batched(
+    plan: torch.Tensor,
+    f: torch.Tensor,
+    g: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    lambda_a: float,
+    lambda_b: float,
+    num_iters: int = 1,
+    eps: float = EPS,
+) -> torch.Tensor:
+    row_target = a * torch.exp(-f / lambda_a)
+    col_target = b * torch.exp(-g / lambda_b)
+    
+    G = plan.clamp_min(eps)
+
+    for _ in range(num_iters):
+        row_sum = G.sum(dim=2)
+        G = G * (row_target / row_sum.clamp_min(eps)).unsqueeze(2)
+
+        col_sum = G.sum(dim=1)
+        G = G * (col_target / col_sum.clamp_min(eps)).unsqueeze(1)
+
+    return G
+
+    
 def run_candidate_coarse_bounds_batched(
     dataset: QuantizedDataset,
     query_index: int,
@@ -377,7 +465,8 @@ def run_candidate_coarse_bounds_batched(
     reference_block_number: int,
     sweeps: int,
     ready_ratio_threshold: float,
-) -> dict:
+    warm_state: Optional[LevelWarmState] = None,
+) -> Tuple[Dict[str, object], Optional[LevelWarmState]]:
     if not candidates:
         return {
             "block_number": int(block_number),
@@ -399,11 +488,23 @@ def run_candidate_coarse_bounds_batched(
 
     level = get_level(dataset, block_number)
 
-    query_weights_np = np.asarray(level["cluster_weights"][query_index], dtype=np.float32)
-    query_centers_np = np.asarray(level["cluster_centers"][query_index], dtype=np.float32)
-    query_radii_np = np.asarray(level["cluster_radii"][query_index], dtype=np.float32)
-    query_means_np = np.asarray(level["weighted_means"][query_index], dtype=np.float32)
-    query_vars_np = np.asarray(level["cluster_variances"][query_index], dtype=np.float32)
+    use_prolongation = (
+        warm_state is not None
+        and int(block_number) in dataset.mappings
+    )
+
+    if use_prolongation:
+        mapping_level = get_mapping(dataset, block_number)
+        pre_level = get_level(dataset, warm_state.block_number)
+    else:
+        mapping_level = None
+        pre_level = None
+
+    num_candidates = len(candidates)
+    candidate_indices_np = np.asarray(
+        [candidate.sample_index for candidate in candidates],
+        dtype=np.int32,
+    )
 
     batch_size = compute_candidate_batch_size(
         problem_size=block_number,
@@ -411,51 +512,100 @@ def run_candidate_coarse_bounds_batched(
         base_batch_size=base_candidate_batch_size,
         min_batch_size=min_candidate_batch_size,
     )
-    batch_size = min(batch_size, len(candidates))
-
-    query_weights = torch_from_numpy(query_weights_np, device, dtype).unsqueeze(0)
-    query_centers = torch_from_numpy(query_centers_np, device, dtype).unsqueeze(0)
-    query_radii = torch_from_numpy(query_radii_np, device, dtype).unsqueeze(0)
-    query_means = torch_from_numpy(query_means_np, device, dtype).unsqueeze(0)
-    query_vars = torch_from_numpy(query_vars_np, device, dtype).unsqueeze(0)
-
-    candidate_indices = np.asarray([candidate.sample_index for candidate in candidates], dtype=np.int32)
-
-    num_candidates = len(candidates)
-
-    batches = []
-    for start in range(0, num_candidates, batch_size):
-        end = min(start + batch_size, num_candidates)
-        batches.append(np.arange(start, end, dtype=np.int32))
-
-    total_ready = 0
-    max_sweeps_used = 0
+    batch_size = min(batch_size, num_candidates)
 
     with torch.no_grad():
-        for original_indices in batches:
-            sample_indices = candidate_indices[original_indices]
-            batch_len = len(original_indices)
+        level_weights = torch.as_tensor(
+            level["cluster_weights"],
+            device=device,
+            dtype=dtype,
+        )
+        level_centers = torch.as_tensor(
+            level["cluster_centers"],
+            device=device,
+            dtype=dtype,
+        )
+        level_radii = torch.as_tensor(
+            level["cluster_radii"],
+            device=device,
+            dtype=dtype,
+        )
+        level_means = torch.as_tensor(
+            level["weighted_means"],
+            device=device,
+            dtype=dtype,
+        )
+        level_vars = torch.as_tensor(
+            level["cluster_variances"],
+            device=device,
+            dtype=dtype,
+        )
 
-            cand_weights = torch_from_numpy(
-                np.asarray(level["cluster_weights"][sample_indices], dtype=np.float32),
-                device, dtype,
+        query_weights = level_weights[query_index].unsqueeze(0)
+        query_centers = level_centers[query_index].unsqueeze(0)
+        query_radii = level_radii[query_index].unsqueeze(0)
+        query_means = level_means[query_index].unsqueeze(0)
+        query_vars = level_vars[query_index].unsqueeze(0)
+
+        if use_prolongation:
+            mapping_gpu = torch.as_tensor(
+                mapping_level,
+                device=device,
+                dtype=torch.long,
             )
-            cand_centers = torch_from_numpy(
-                np.asarray(level["cluster_centers"][sample_indices], dtype=np.float32),
-                device, dtype,
+
+            pre_weights_gpu = torch.as_tensor(
+                pre_level["cluster_weights"],
+                device=device,
+                dtype=dtype,
             )
-            cand_radii = torch_from_numpy(
-                np.asarray(level["cluster_radii"][sample_indices], dtype=np.float32),
-                device, dtype,
+            pre_level_upper_plans = torch.as_tensor(
+                warm_state.upper_plans,
+                device=device,
+                dtype=dtype,
             )
-            cand_means = torch_from_numpy(
-                np.asarray(level["weighted_means"][sample_indices], dtype=np.float32),
-                device, dtype,
+            pre_level_lower_plans = torch.as_tensor(
+                warm_state.lower_plans,
+                device=device,
+                dtype=dtype,
             )
-            cand_vars = torch_from_numpy(
-                np.asarray(level["cluster_variances"][sample_indices], dtype=np.float32),
-                device, dtype,
+            pre_level_fs = torch.as_tensor(
+                warm_state.fs,
+                device=device,
+                dtype=dtype,
             )
+            pre_level_gs = torch.as_tensor(
+                warm_state.gs,
+                device=device,
+                dtype=dtype,
+            )
+
+        lower_plan_store: Optional[np.ndarray] = None
+        upper_plan_store: Optional[np.ndarray] = None
+        f_store: Optional[np.ndarray] = None
+        g_store: Optional[np.ndarray] = None
+
+        total_ready = 0
+        max_sweeps_used = 0
+
+        for start in range(0, num_candidates, batch_size):
+            end = min(start + batch_size, num_candidates)
+            original_indices = slice(start, end)
+            sample_indices_np = candidate_indices_np[start:end]
+
+            batch_len = end - start
+
+            sample_indices_gpu = torch.as_tensor(
+                sample_indices_np,
+                device=device,
+                dtype=torch.long,
+            )
+
+            cand_weights = level_weights.index_select(0, sample_indices_gpu)
+            cand_centers = level_centers.index_select(0, sample_indices_gpu)
+            cand_radii = level_radii.index_select(0, sample_indices_gpu)
+            cand_means = level_means.index_select(0, sample_indices_gpu)
+            cand_vars = level_vars.index_select(0, sample_indices_gpu)
 
             query_weights_batch = query_weights.expand(batch_len, -1)
             query_centers_batch = query_centers.expand(batch_len, -1, -1)
@@ -463,12 +613,99 @@ def run_candidate_coarse_bounds_batched(
             query_means_batch = query_means.expand(batch_len, -1, -1)
             query_vars_batch = query_vars.expand(batch_len, -1)
 
+            lower_dual_gpu = torch.as_tensor(
+                np.asarray(
+                    [candidate.lower_bound_dual for candidate in candidates[start:end]],
+                    dtype=np.float32,
+                ),
+                device=device,
+                dtype=dtype,
+            )
+            lower_primal_gpu = torch.as_tensor(
+                np.asarray(
+                    [candidate.lower_bound_primal for candidate in candidates[start:end]],
+                    dtype=np.float32,
+                ),
+                device=device,
+                dtype=dtype,
+            )
+            upper_dual_gpu = torch.as_tensor(
+                np.asarray(
+                    [candidate.upper_bound_dual for candidate in candidates[start:end]],
+                    dtype=np.float32,
+                ),
+                device=device,
+                dtype=dtype,
+            )
+            upper_primal_gpu = torch.as_tensor(
+                np.asarray(
+                    [candidate.upper_bound_primal for candidate in candidates[start:end]],
+                    dtype=np.float32,
+                ),
+                device=device,
+                dtype=dtype,
+            )
+
+            lower_plan = None
+            upper_plan = None
+            ready_mask = torch.zeros(batch_len, dtype=torch.bool, device=device)
+
+            if use_prolongation:
+                query_map = mapping_gpu[query_index]
+                cand_map = mapping_gpu.index_select(0, sample_indices_gpu)
+
+                query_map_batch = query_map.unsqueeze(0).expand(batch_len, -1)
+                pre_query_weights = pre_weights_gpu[query_index].unsqueeze(0).expand(
+                    batch_len, -1
+                )
+                pre_cand_weights = pre_weights_gpu.index_select(
+                    0, sample_indices_gpu
+                )
+
+                upper_plan = prolong_plan_to_children_batch(
+                    parent_plan=pre_level_upper_plans[original_indices],
+                    map_a=query_map_batch,
+                    map_b=cand_map,
+                    a_pi=pre_query_weights,
+                    a_pi_prime=query_weights_batch,
+                    b_pi=pre_cand_weights,
+                    b_pi_prime=cand_weights,
+                )
+                lower_plan = prolong_plan_to_children_batch(
+                    parent_plan=pre_level_lower_plans[original_indices],
+                    map_a=query_map_batch,
+                    map_b=cand_map,
+                    a_pi=pre_query_weights,
+                    a_pi_prime=query_weights_batch,
+                    b_pi=pre_cand_weights,
+                    b_pi_prime=cand_weights,
+                )
+
+                f_child, g_child = prolong_potentials_to_children_batch(
+                    f=pre_level_fs[original_indices],
+                    g=pre_level_gs[original_indices],
+                    map_a=query_map_batch,
+                    map_b=cand_map,
+                )
+
+                lower_plan = project_plan_to_marginals_batched(
+                    plan=lower_plan,
+                    f=f_child,
+                    g=g_child,
+                    a=query_weights_batch,
+                    b=cand_weights,
+                    lambda_a=lambda_a,
+                    lambda_b=lambda_b,
+                    num_iters=1,
+                )
+                
             lower_cost = batched_bounding_ball_cost(
                 query_centers_batch,
                 query_radii_batch,
                 cand_centers,
                 cand_radii,
             )
+
             upper_cost = batched_product_lift_cost(
                 query_means_batch,
                 query_vars_batch,
@@ -476,48 +713,15 @@ def run_candidate_coarse_bounds_batched(
                 cand_vars,
             )
 
-            lower_dual_gpu = torch_from_numpy(
-                np.asarray(
-                    [float(candidates[int(i)].lower_bound_dual) for i in original_indices],
-                    dtype=np.float32,
-                ),
-                device, dtype,
-            )
-            lower_primal_gpu = torch_from_numpy(
-                np.asarray(
-                    [float(candidates[int(i)].lower_bound_primal) for i in original_indices],
-                    dtype=np.float32,
-                ),
-                device, dtype,
-            )
-            upper_dual_gpu = torch_from_numpy(
-                np.asarray(
-                    [float(candidates[int(i)].upper_bound_dual) for i in original_indices],
-                    dtype=np.float32,
-                ),
-                device, dtype,
-            )
-            upper_primal_gpu = torch_from_numpy(
-                np.asarray(
-                    [float(candidates[int(i)].upper_bound_primal) for i in original_indices],
-                    dtype=np.float32,
-                ),
-                device, dtype,
-            )
-
-            lower_plan = None
-            upper_plan = None
-            ready_mask = torch.zeros(batch_len, dtype=torch.bool, device=device)
-            batch_sweeps_used = 0
-
             for sweep_idx in range(sweeps):
                 batch_sweeps_used = sweep_idx + 1
-
                 (
                     lower_dual,
                     lower_primal,
                     lower_plan,
                     lower_valid,
+                    f_child,
+                    g_child,
                 ) = compute_mm_dual_bounds_batched(
                     query_weights_batch,
                     cand_weights,
@@ -533,6 +737,8 @@ def run_candidate_coarse_bounds_batched(
                     upper_primal,
                     upper_plan,
                     upper_valid,
+                    _,
+                    _,
                 ) = compute_mm_dual_bounds_batched(
                     query_weights_batch,
                     cand_weights,
@@ -543,10 +749,6 @@ def run_candidate_coarse_bounds_batched(
                     init_plan=upper_plan,
                 )
 
-                lower_dual = lower_dual.to(dtype)
-                lower_primal = lower_primal.to(dtype)
-                upper_dual = upper_dual.to(dtype)
-                upper_primal = upper_primal.to(dtype)
                 lower_valid = lower_valid.to(torch.bool)
                 upper_valid = upper_valid.to(torch.bool)
 
@@ -571,54 +773,117 @@ def run_candidate_coarse_bounds_batched(
                     upper_primal_gpu,
                 )
 
-                lower_gap = torch.clamp(lower_primal_gpu - lower_dual_gpu, min=0.0)
-                upper_gap = torch.clamp(upper_primal_gpu - upper_dual_gpu, min=0.0)
+                lower_gap = torch.clamp(
+                    lower_primal_gpu - lower_dual_gpu,
+                    min=0.0,
+                )
+                upper_gap = torch.clamp(
+                    upper_primal_gpu - upper_dual_gpu,
+                    min=0.0,
+                )
                 delta_opt = lower_gap + upper_gap
-                delta_block = torch.clamp(upper_dual_gpu - lower_primal_gpu, min=0.0)
+
+                delta_block = torch.clamp(
+                    upper_dual_gpu - lower_primal_gpu,
+                    min=0.0,
+                )
 
                 ready_mask = delta_opt < delta_block
 
-                batch_ready_ratio = float(ready_mask.float().mean().item())
+                batch_ready_ratio = float(
+                    ready_mask.float().mean().item()
+                )
+
                 if batch_ready_ratio >= ready_ratio_threshold:
                     break
 
-            max_sweeps_used = max(max_sweeps_used, batch_sweeps_used)
+            max_sweeps_used = max(
+                max_sweeps_used,
+                batch_sweeps_used,
+            )
             total_ready += int(ready_mask.sum().item())
 
-            lbd_np = lower_dual_gpu.detach().cpu().numpy()
-            lbp_np = lower_primal_gpu.detach().cpu().numpy()
-            ubd_np = upper_dual_gpu.detach().cpu().numpy()
-            ubp_np = upper_primal_gpu.detach().cpu().numpy()
+            lbd_np = lower_dual_gpu.cpu().numpy()
+            lbp_np = lower_primal_gpu.cpu().numpy()
+            ubd_np = upper_dual_gpu.cpu().numpy()
+            ubp_np = upper_primal_gpu.cpu().numpy()
+            lower_plan_np = lower_plan.detach().cpu().numpy()
+            upper_plan_np = upper_plan.detach().cpu().numpy()
+            f_np = f_child.detach().cpu().numpy()
+            g_np = g_child.detach().cpu().numpy()
 
-            for k in range(batch_len):
-                cand = candidates[int(original_indices[k])]
-                cand.lower_bound_dual = float(lbd_np[k])
-                cand.lower_bound_primal = float(lbp_np[k])
-                cand.upper_bound_dual = float(ubd_np[k])
-                cand.upper_bound_primal = float(ubp_np[k])
+            if lower_plan_store is None:
+                lower_plan_store = np.empty(
+                    (num_candidates,) + tuple(lower_plan_np.shape[1:]),
+                    dtype=lower_plan_np.dtype,
+                )
+                upper_plan_store = np.empty(
+                    (num_candidates,) + tuple(upper_plan_np.shape[1:]),
+                    dtype=upper_plan_np.dtype,
+                )
+                f_store = np.empty(
+                    (num_candidates,) + tuple(f_np.shape[1:]),
+                    dtype=f_np.dtype,
+                )
+                g_store = np.empty(
+                    (num_candidates,) + tuple(g_np.shape[1:]),
+                    dtype=g_np.dtype,
+                )
 
+            lower_plan_store[start:end] = lower_plan_np
+            upper_plan_store[start:end] = upper_plan_np
+            f_store[start:end] = f_np
+            g_store[start:end] = g_np
+
+            for k, candidate in enumerate(candidates[start:end]):
+                candidate.lower_bound_dual = float(lbd_np[k])
+                candidate.lower_bound_primal = float(lbp_np[k])
+                candidate.upper_bound_dual = float(ubd_np[k])
+                candidate.upper_bound_primal = float(ubp_np[k])
+
+            del sample_indices_gpu
             del cand_weights, cand_centers, cand_radii, cand_means, cand_vars
-            del lower_cost, upper_cost
-            del lower_dual_gpu, lower_primal_gpu, upper_dual_gpu, upper_primal_gpu
+            del query_weights_batch, query_centers_batch
+            del query_radii_batch, query_means_batch, query_vars_batch
+            del lower_dual_gpu, lower_primal_gpu
+            del upper_dual_gpu, upper_primal_gpu
             del lower_plan, upper_plan
             del ready_mask
 
-    overall_ready_ratio = total_ready / num_candidates
+        if use_prolongation:
+            del mapping_gpu
+            del pre_weights_gpu
+            del pre_level_upper_plans
+            del pre_level_lower_plans
+            del pre_level_fs
+            del pre_level_gs
 
-    return {
+    overall_ready_ratio = total_ready / num_candidates
+    level_summary: Dict[str, object] = {
         "block_number": int(block_number),
         "num_candidates": num_candidates,
         "sweeps_used": int(max_sweeps_used),
         "ready_ratio": float(overall_ready_ratio),
-        "candidate_batch_size": int(batch_size)
+        "candidate_batch_size": int(batch_size),
+        "remaining_active": 0,
     }
+    if lower_plan_store is None:
+        return level_summary, None
+    next_warm_state = LevelWarmState(
+        block_number=int(block_number),
+        lower_plans=lower_plan_store,
+        upper_plans=upper_plan_store,
+        fs=f_store,
+        gs=g_store,
+    )
+    return level_summary, next_warm_state
 
-            
 
 def run_candidate_exact_bounds_batched(
     dataset: QuantizedDataset,
     query_index: int,
     candidates: Sequence[CandidateState],
+    exact_block_number: int,
     lambda_a: float,
     lambda_b: float,
     exact_iters: int,
@@ -628,12 +893,35 @@ def run_candidate_exact_bounds_batched(
     base_exact_batch_size: int,
     min_exact_batch_size: int,
     reference_problem_size: int,
+    warm_state: Optional[LevelWarmState] = None,
 ) -> int:
     if not candidates:
         return 0
 
-    query_weights_np = np.asarray(dataset.measure[query_index], dtype=np.float32)
-    query_coords_np = np.asarray(dataset.data_coords[query_index], dtype=np.float32)
+    if exact_iters <= 0:
+        raise ValueError("exact_iters must be positive.")
+
+    use_prolongation = (
+        warm_state is not None
+        and int(exact_block_number) in dataset.mappings
+    )
+
+    if use_prolongation:
+        mapping_level = get_mapping(dataset, exact_block_number)
+        pre_level = get_level(dataset, warm_state.block_number)
+    else:
+        mapping_level = None
+        pre_level = None
+
+    query_weights_np = np.asarray(
+        dataset.measure[query_index],
+        dtype=np.float32,
+    )
+    query_coords_np = np.asarray(
+        dataset.data_coords[query_index],
+        dtype=np.float32,
+    )
+
     point_count = int(query_weights_np.shape[0])
 
     batch_size = compute_candidate_batch_size(
@@ -644,63 +932,280 @@ def run_candidate_exact_bounds_batched(
     )
     batch_size = min(batch_size, len(candidates))
 
+    candidate_indices_np = np.asarray(
+        [candidate.sample_index for candidate in candidates],
+        dtype=np.int64,
+    )
+
     with torch.no_grad():
+        all_weights_gpu = torch.as_tensor(
+            dataset.measure,
+            device=device,
+            dtype=dtype,
+        )
+
+        all_coords_gpu = torch.as_tensor(
+            dataset.data_coords,
+            device=device,
+            dtype=dtype,
+        )
+
+        query_weights = all_weights_gpu[query_index]
+        query_coords = all_coords_gpu[query_index]
+
+        if use_prolongation:
+            mapping_gpu = torch.as_tensor(
+                mapping_level,
+                device=device,
+                dtype=torch.long,
+            )
+
+            pre_weights_gpu = torch.as_tensor(
+                pre_level["cluster_weights"],
+                device=device,
+                dtype=dtype,
+            )
+            pre_level_upper_plans = torch.as_tensor(
+                warm_state.upper_plans,
+                device=device,
+                dtype=dtype,
+            )
+            pre_level_lower_plans = torch.as_tensor(
+                warm_state.lower_plans,
+                device=device,
+                dtype=dtype,
+            )
+            pre_level_fs = torch.as_tensor(
+                warm_state.fs,
+                device=device,
+                dtype=dtype,
+            )
+            pre_level_gs = torch.as_tensor(
+                warm_state.gs,
+                device=device,
+                dtype=dtype,
+            )
+
         for start in range(0, len(candidates), batch_size):
-            batch_candidates = list(candidates[start : start + batch_size])
-            candidate_indices = np.asarray([cand.sample_index for cand in batch_candidates], dtype=np.int64)
-            batch_len = len(batch_candidates)
+            end = min(start + batch_size, len(candidates))
+            batch_len = end - start
 
-            cand_weights_np = np.asarray(dataset.measure[candidate_indices], dtype=np.float32)
-            cand_coords_np = np.asarray(dataset.data_coords[candidate_indices], dtype=np.float32)
-            query_weights_batch_np = np.repeat(query_weights_np[None, :], batch_len, axis=0)
+            sample_indices_gpu = torch.as_tensor(
+                candidate_indices_np[start:end],
+                device=device,
+                dtype=torch.long,
+            )
 
-            query_weights = torch_from_numpy(query_weights_batch_np, device, dtype)
-            cand_weights = torch_from_numpy(cand_weights_np, device, dtype)
-            query_coords = torch_from_numpy(np.repeat(query_coords_np[None, :, :], batch_len, axis=0), device, dtype)
-            cand_coords = torch_from_numpy(cand_coords_np, device, dtype)
+            cand_weights = all_weights_gpu.index_select(
+                0,
+                sample_indices_gpu,
+            )
 
-            cost = batched_exact_cost(query_coords, cand_coords)
-            exact_dual, exact_primal, exact_plan, exact_valid = compute_mm_dual_bounds_batched(
-                query_weights,
+            cand_coords = all_coords_gpu.index_select(
+                0,
+                sample_indices_gpu,
+            )
+
+            # Query is broadcast using expand(), so no batch-sized copy.
+            query_weights_batch = query_weights.unsqueeze(0).expand(
+                batch_len,
+                -1,
+            )
+
+            query_coords_batch = query_coords.unsqueeze(0).expand(
+                batch_len,
+                -1,
+                -1,
+            )
+
+            cost = batched_exact_cost(
+                query_coords_batch,
+                cand_coords,
+            )
+
+            init_plan = None
+
+            if use_prolongation:
+                query_map = mapping_gpu[query_index]
+                cand_map = mapping_gpu.index_select(
+                    0,
+                    sample_indices_gpu,
+                )
+
+                query_map_batch = query_map.unsqueeze(0).expand(
+                    batch_len,
+                    -1,
+                )
+
+                pre_query_weights = pre_weights_gpu[query_index].unsqueeze(0).expand(
+                    batch_len,
+                    -1,
+                )
+
+                pre_cand_weights = pre_weights_gpu.index_select(
+                    0,
+                    sample_indices_gpu,
+                )
+
+                upper_plan = prolong_plan_to_children_batch(
+                    parent_plan=pre_level_upper_plans[start:end],
+                    map_a=query_map_batch,
+                    map_b=cand_map,
+                    a_pi=pre_query_weights,
+                    a_pi_prime=query_weights_batch,
+                    b_pi=pre_cand_weights,
+                    b_pi_prime=cand_weights,
+                )
+                lower_plan = prolong_plan_to_children_batch(
+                    parent_plan=pre_level_lower_plans[start:end],
+                    map_a=query_map_batch,
+                    map_b=cand_map,
+                    a_pi=pre_query_weights,
+                    a_pi_prime=query_weights_batch,
+                    b_pi=pre_cand_weights,
+                    b_pi_prime=cand_weights,
+                )
+
+                f_child, g_child = prolong_potentials_to_children_batch(
+                    f=pre_level_fs[start:end],
+                    g=pre_level_gs[start:end],
+                    map_a=query_map_batch,
+                    map_b=cand_map,
+                )
+
+                lower_plan = project_plan_to_marginals_batched(
+                    plan=lower_plan,
+                    f=f_child,
+                    g=g_child,
+                    a=query_weights_batch,
+                    b=cand_weights,
+                    lambda_a=lambda_a,
+                    lambda_b=lambda_b,
+                    num_iters=1,
+                )
+
+                # Use the prolongated upper plan as the MM warm start.
+                # If it is unavailable, fall back to the projected lower plan.
+                init_plan = upper_plan
+                if init_plan is None:
+                    init_plan = lower_plan
+
+            (
+                exact_dual,
+                exact_primal,
+                exact_plan,
+                exact_valid,
+                f_child,
+                g_child,
+            ) = compute_mm_dual_bounds_batched(
+                query_weights_batch,
                 cand_weights,
                 cost,
                 lambda_a,
                 lambda_b,
                 exact_iters,
-                init_plan=None,
+                init_plan=init_plan,
             )
 
-            exact_dual_np = exact_dual.detach().cpu().numpy()
-            exact_primal_np = exact_primal.detach().cpu().numpy()
-            exact_plan_np = exact_plan.detach().cpu().numpy()
-            exact_valid_np = exact_valid.detach().cpu().numpy()
+            exact_dual_np = exact_dual.cpu().numpy()
+            exact_primal_np = exact_primal.cpu().numpy()
+            exact_valid_np = exact_valid.cpu().numpy()
 
-            for local_idx, candidate in enumerate(batch_candidates):
+            improved_mask = (
+                exact_primal_np
+                < np.asarray(
+                    [
+                        candidate.exact_primal
+                        for candidate in candidates[start:end]
+                    ],
+                    dtype=np.float64,
+                )
+            )
+
+            # ----------------------------------------------------------
+            # Preserve the original bound update logic.
+            # ----------------------------------------------------------
+            for local_idx, candidate in enumerate(candidates[start:end]):
                 if bool(exact_valid_np[local_idx]):
-                    candidate.exact_dual = max(candidate.exact_dual, float(exact_dual_np[local_idx]))
+                    candidate.exact_dual = max(
+                        candidate.exact_dual,
+                        float(exact_dual_np[local_idx]),
+                    )
+
                 exact_primal_value = float(exact_primal_np[local_idx])
+
                 if exact_primal_value < candidate.exact_primal:
                     candidate.exact_primal = exact_primal_value
-                    candidate.exact_plan = exact_plan_np[local_idx]
+                    candidate.exact_plan = (
+                        exact_plan[local_idx].cpu().numpy()
+                    )
 
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+            # ----------------------------------------------------------
+            # Release batch-local GPU memory.
+            # Do NOT call torch.cuda.empty_cache() here; that would
+            # unnecessarily synchronize with the CUDA allocator.
+            # ----------------------------------------------------------
+            del sample_indices_gpu
+            del cand_weights
+            del cand_coords
+            del query_weights_batch
+            del query_coords_batch
+            del cost
+            del exact_dual
+            del exact_primal
+            del exact_plan
+            del exact_valid
+
+            if use_prolongation:
+                del upper_plan
+                del lower_plan
+                del f_child
+                del g_child
+
+        if use_prolongation:
+            del mapping_gpu
+            del pre_weights_gpu
+            del pre_level_upper_plans
+            del pre_level_lower_plans
+            del pre_level_fs
+            del pre_level_gs
+
     return batch_size
 
 
 def filter_topk_candidates(
     candidates: Sequence[CandidateState],
     keep_k: int,
-) -> List[CandidateState]:
+) -> Tuple[List[CandidateState], List[int]]:
     if keep_k <= 0:
         raise ValueError("keep_k must be positive.")
+    if len(candidates) <= keep_k:
+        return list(candidates), list(range(len(candidates)))
     ranked = sorted(candidates, key=lambda cand: (cand.upper_bound, cand.sample_id))
     tau = ranked[keep_k - 1].upper_bound
     remaining = []
-    for cand in candidates:
+    index = []
+    for (i, cand) in enumerate(candidates):
         if cand.lower_bound <= tau:
             remaining.append(cand)
-    return remaining
+            index.append(i)
+    return remaining, index
+
+
+def subset_level_warm_state(
+    warm_state: Optional[LevelWarmState],
+    kept_positions: Sequence[int],
+) -> Optional[LevelWarmState]:
+    if warm_state is None:
+        return None
+    kept_positions_np = np.asarray(list(kept_positions), dtype=np.int64)
+    return LevelWarmState(
+        block_number=warm_state.block_number,
+        lower_plans=warm_state.lower_plans[kept_positions_np],
+        upper_plans=warm_state.upper_plans[kept_positions_np],
+        fs=warm_state.fs[kept_positions_np],
+        gs=warm_state.gs[kept_positions_np],
+    )
 
 
 def result_to_csv_rows(result: Dict[str, object]) -> List[Dict[str, object]]:
@@ -800,8 +1305,8 @@ def run_single_query_with_progress(
     dataset: QuantizedDataset,
     query_index: int,
     *,
-    block_numbers: Sequence[int],           
-    exact_block_number: int,               
+    block_numbers: Sequence[int],
+    exact_block_number: int,
     keep_k: int,
     lambda_a: float,
     lambda_b: float,
@@ -843,24 +1348,20 @@ def run_single_query_with_progress(
     level_history: List[Dict[str, object]] = []
     current_candidates: List[CandidateState] = candidates
     reference_block_number = int(block_numbers[0])
-
+    warm_state: Optional[LevelWarmState] = None
+    exact_batch_size = 0
 
     levels: List[Tuple[str, int]] = (
-        [("coarse", int(bn)) for bn in block_numbers]
+        [("coarse", int(block_number)) for block_number in block_numbers]
         + [("exact", int(exact_block_number))]
     )
-    num_levels = len(levels)
-
-    exact_batch_size = 0 
 
     for level_pos, (level_kind, block_number) in enumerate(levels):
         level_start = time.perf_counter()
         num_before = len(current_candidates)
-
         if level_kind == "coarse":
-            # -------- coarse level --------
             reset_coarse_level_state(current_candidates)
-            level_summary = run_candidate_coarse_bounds_batched(
+            level_summary, warm_state = run_candidate_coarse_bounds_batched(
                 dataset,
                 query_index,
                 current_candidates,
@@ -874,13 +1375,15 @@ def run_single_query_with_progress(
                 dtype=dtype,
                 base_candidate_batch_size=base_candidate_batch_size,
                 min_candidate_batch_size=min_candidate_batch_size,
-                reference_block_number=reference_block_number
+                reference_block_number=reference_block_number,
+                warm_state=warm_state,
             )
         else:
             exact_batch_size = run_candidate_exact_bounds_batched(
                 dataset,
                 query_index,
                 current_candidates,
+                exact_block_number,
                 lambda_a,
                 lambda_b,
                 final_exact_iters,
@@ -889,8 +1392,8 @@ def run_single_query_with_progress(
                 base_exact_batch_size=base_exact_batch_size,
                 min_exact_batch_size=min_exact_batch_size,
                 reference_problem_size=reference_block_number,
+                warm_state=warm_state,
             )
-
             level_summary = {
                 "block_number": int(block_number),
                 "num_candidates": int(num_before),
@@ -901,11 +1404,11 @@ def run_single_query_with_progress(
 
         level_summary["level_pos"] = int(level_pos)
         level_summary["level_kind"] = level_kind
-        level_summary["block_number"] = int(block_number)
         level_summary["num_candidates_before_filter"] = int(num_before)
-
-        current_candidates = filter_topk_candidates(current_candidates, keep_k)
+        current_candidates, kept_positions = filter_topk_candidates(current_candidates, keep_k)
+        warm_state = subset_level_warm_state(warm_state, kept_positions)
         level_summary["num_candidates_after_filter"] = int(len(current_candidates))
+
         level_summary["level_elapsed_seconds"] = float(time.perf_counter() - level_start)
         level_history.append(level_summary)
 
@@ -920,17 +1423,15 @@ def run_single_query_with_progress(
                 "block_number": int(block_number),
                 "num_candidates_before_filter": int(level_summary["num_candidates_before_filter"]),
                 "num_candidates_after_filter": int(level_summary["num_candidates_after_filter"]),
-                "ready_ratio": float(level_summary.get("ready_ratio", 1.0)),
-                "sweeps_used": int(level_summary.get("sweeps_used", 0)),
+                "ready_ratio": float(level_summary["ready_ratio"]),
+                "sweeps_used": int(level_summary["sweeps_used"]),
                 "level_elapsed_seconds": float(level_summary["level_elapsed_seconds"]),
             }
         )
-
     ranked_candidates = sorted(
         current_candidates,
         key=lambda cand: (cand.upper_bound, cand.sample_id),
     )
-
     result = {
         "query_id": query_id,
         "query_index": int(query_index),
@@ -1230,15 +1731,14 @@ def main(ready_ratio_threshold, output_dir) -> None:
         f"finished total_elapsed={total_elapsed:.2f}s "
         f"completed={completed_queries} failed={failed_queries} total={total_queries}"
     )
-
     print(f"Progress log saved to: {progress_log_path}")
     print(f"Query progress log saved to: {Path(output_dir) / 'multi_gpu_query_progress.log'}")
     write_progress_log_line(progress_log_path, final_line)
 
 
 if __name__ == "__main__":
-    main(0.5, './knn_uot_results_50_new')
-    # main(0.75, './knn_uot_results_75')
-    # main(0.8, './knn_uot_results_80')
-    # main(0.9, './knn_uot_results_90')
-    # main(1, './knn_uot_results_100')
+    main(0.5, "./knn_uot_results_50_warmstart")
+    # main(0.75, "./knn_uot_results_75_warmstart")
+    # main(0.8, "./knn_uot_results_80_warmstart")
+    # main(0.9, "./knn_uot_results_90_warmstart")
+    # main(1, "./knn_uot_results_100_warmstart")
